@@ -1,0 +1,310 @@
+/*
+ * Task queue column — the per-worktree backlog rendered as the first column
+ * inside a worktree row's `.sessions-strip` (see plans/PLAN-tasks.md and
+ * QueueColumn.svelte). Lives here (not scoped in the .svelte) because, like
+ * `.session-col`, it's a strip sibling: the row-folded `display:none` rules
+ * and the strip's flex layout reach it the same way. All colours come from
+ * the design tokens so a re-skin stays a single-file edit.
+ */
+
+.queue-col {
+  /* A list, not a terminal — narrower than .session-col, but `stretch` makes
+     it the same height as the terminal columns beside it. */
+  flex: 0 0 18rem;
+  min-width: 16rem;
+  max-width: 20rem;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface-0);
+  border: 1px solid color-mix(in srgb, var(--brand) 22%, var(--surface-2));
+  border-radius: var(--radius-md);
+}
+
+.queue-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  height: 2.1rem;
+  padding: 0 0.55rem;
+  border-bottom: 1px solid var(--surface-2);
+  background: color-mix(in srgb, var(--brand) 8%, var(--surface-1));
+}
+.queue-label {
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: var(--needle-green);
+}
+.queue-count {
+  font-size: 0.66rem;
+  font-weight: 700;
+  color: var(--text-faint);
+  border: 1px solid var(--surface-2);
+  border-radius: 9px;
+  padding: 0 0.4rem;
+}
+.queue-head-spacer {
+  flex: 1;
+}
+.queue-add-btn {
+  width: 1.3rem;
+  height: 1.3rem;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--surface-2);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+}
+.queue-add-btn:hover {
+  color: var(--text-1);
+  background: var(--surface-3);
+}
+
+/* composer ------------------------------------------------------------- */
+.queue-composer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--surface-2);
+}
+.queue-input,
+.queue-prompt,
+.queue-agent-select {
+  width: 100%;
+  background: var(--surface-1);
+  border: 1px solid var(--surface-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  padding: 0.35rem 0.45rem;
+  font-size: 0.78rem;
+  outline: none;
+}
+.queue-prompt {
+  resize: vertical;
+  min-height: 2.4rem;
+  font-family: inherit;
+}
+.queue-input:focus,
+.queue-prompt:focus,
+.queue-agent-select:focus {
+  border-color: var(--brand);
+}
+.queue-composer-row {
+  display: flex;
+  gap: 0.35rem;
+}
+.queue-agent-select {
+  flex: 1;
+}
+.queue-add-confirm {
+  flex: 0 0 auto;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--brand);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--brand) 16%, transparent);
+  color: var(--brand-hover);
+  font-weight: 700;
+  font-size: 0.74rem;
+  cursor: pointer;
+}
+.queue-add-confirm:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* list ----------------------------------------------------------------- */
+.queue-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.queue-empty {
+  margin: 0.4rem 0.2rem;
+  padding: 0.6rem;
+  border: 1px dashed var(--surface-2);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 0.74rem;
+  text-align: center;
+  cursor: pointer;
+}
+.queue-empty:hover {
+  border-color: var(--surface-3);
+  color: var(--text-muted);
+}
+.queue-empty-cta {
+  color: var(--brand-hover);
+  font-weight: 700;
+}
+
+.queue-task {
+  display: grid;
+  /* dot | body | play. The trailing `auto` collapses to 0 for done/running
+     tasks that render no play button, so those rows look unchanged. */
+  grid-template-columns: 0.8rem 1fr auto;
+  gap: 0.5rem;
+  padding: 0.5rem 0.55rem;
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  border: 1px solid transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.queue-task:hover {
+  background: var(--surface-input-hover);
+}
+.queue-task-selected {
+  background: var(--selected-bg);
+  border-color: color-mix(in srgb, var(--brand) 30%, transparent);
+  box-shadow: inset 2px 0 0 var(--brand);
+}
+
+.queue-dot {
+  margin-top: 0.2rem;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  border: 2px solid var(--text-faint);
+}
+.queue-task-ready .queue-dot {
+  border-color: var(--brand);
+}
+.queue-task-blocked .queue-dot {
+  border-color: var(--error);
+  background: var(--error);
+}
+.queue-task-done .queue-dot {
+  border-color: var(--status-clean);
+  background: var(--status-clean);
+}
+
+/* Play button — the primary "actually start it" affordance on each
+   actionable task. Sits in the trailing grid column, top-aligned so it
+   stays put as the row expands to show the prompt + actions. */
+.queue-play {
+  align-self: start;
+  margin-top: 0.05rem;
+  width: 1.5rem;
+  height: 1.5rem;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--brand) 45%, var(--surface-2));
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--brand) 14%, transparent);
+  color: var(--brand-hover);
+  font-size: 0.7rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.queue-play:hover {
+  background: color-mix(in srgb, var(--brand) 28%, transparent);
+  border-color: var(--brand);
+  color: var(--text-1);
+}
+
+.queue-task-body {
+  min-width: 0;
+}
+.queue-task-title {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-task-done .queue-task-title {
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+.queue-task-meta {
+  margin-top: 0.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+.queue-badge {
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 0.05rem 0.35rem;
+  border-radius: var(--radius-sm);
+}
+.queue-badge-ready {
+  color: var(--chip-green-text);
+  background: var(--chip-green-bg);
+}
+.queue-badge-blocked {
+  color: var(--error-text);
+  background: var(--error-bg);
+}
+.queue-badge-done {
+  color: var(--status-clean);
+  background: transparent;
+  padding-left: 0;
+}
+.queue-agent-chip {
+  font-size: 0.6rem;
+  color: var(--text-faint);
+  border: 1px solid var(--surface-2);
+  border-radius: var(--radius-sm);
+  padding: 0 0.3rem;
+}
+.queue-by-agent {
+  font-size: 0.6rem;
+  color: var(--chip-purple-text);
+}
+
+.queue-task-prompt {
+  margin-top: 0.4rem;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  color: var(--text-3);
+  white-space: pre-wrap;
+  max-height: 9rem;
+  overflow-y: auto;
+}
+.queue-task-blocked {
+  margin-top: 0.3rem;
+  font-size: 0.7rem;
+  color: var(--error-text);
+}
+.queue-task-actions {
+  margin-top: 0.45rem;
+  display: flex;
+  gap: 0.35rem;
+}
+.queue-task-action {
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--surface-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  color: var(--text-2);
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+.queue-task-action:hover {
+  background: var(--surface-3);
+  color: var(--text-1);
+}
+.queue-task-danger:hover {
+  border-color: var(--error);
+  color: var(--error-text);
+}

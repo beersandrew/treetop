@@ -57,6 +57,10 @@ export interface OpenSession {
   mode?: "terminal";
   ollamaModel?: string;
   contextFilePath?: string;
+  /** Prompt seeded into a brand-new agent column when the session is
+   *  started from the task queue (play button). Consumed by
+   *  `cmdForOpenSession` on the fresh spawn only. */
+  initialPrompt?: string;
   attachTermId?: string;
   /** Claude model/effort overrides picked from the session header; passed
    *  through to a `claude --resume … --model/--effort` spawn. */

@@ -126,4 +126,28 @@ describe("OrphanCleaner", () => {
     expect(killed).toBe(true);
     cleaner.dispose();
   });
+
+  test("isFrontendConnected reflects the connect/disconnect refcount", () => {
+    const cleaner = new OrphanCleaner({
+      orphanTimeoutMs: 100,
+      killGraceMs: 50,
+      getTerminals: () => [],
+      killTerminal: async () => {},
+      log: () => {},
+    });
+
+    // The per-terminal grace-reaper consults this to decide whether to keep an
+    // off-screen PTY alive. The app's SSE stream and each terminal WS both
+    // count, so a terminal WS closing (column scrolled off-screen) must NOT
+    // read as "no frontend" while the SSE stream is still connected.
+    expect(cleaner.isFrontendConnected()).toBe(false);
+    cleaner.onFrontendConnected(); // SSE stream
+    expect(cleaner.isFrontendConnected()).toBe(true);
+    cleaner.onFrontendConnected(); // a terminal WS
+    cleaner.onFrontendDisconnected(); // that terminal WS closes (scroll-off)
+    expect(cleaner.isFrontendConnected()).toBe(true);
+    cleaner.onFrontendDisconnected(); // SSE stream closes (app gone)
+    expect(cleaner.isFrontendConnected()).toBe(false);
+    cleaner.dispose();
+  });
 });

@@ -119,6 +119,8 @@
   import { openInvite } from "./receive-invite-dialog";
   import MessagesInbox from "./MessagesInbox.svelte";
   import { refreshMessages } from "./messages-store";
+  import { refreshTasks } from "./tasks-store";
+  import QueueColumn from "./QueueColumn.svelte";
   import RepoRecentSummary from "./RepoRecentSummary.svelte";
   import { marked } from "marked";
   import DOMPurify from "dompurify";
@@ -677,6 +679,47 @@
   }
   /** Which daemon's "manage" dialog is open (its id), or null. */
   let daemonDialogId: string | null = null;
+  /** True while a "Redeploy prod" build is in flight (disables the button). */
+  let redeploying = false;
+
+  /** Rebuild the prod SPA (packages/ui/dist) from the current source. Prod
+   *  serves that dir fresh from disk, so a rebuild is a full UI redeploy —
+   *  no daemon restart, no killed PTYs. The user reloads their prod tab to
+   *  see it. Ships UI changes only, not daemon-code changes. */
+  async function redeployProd(): Promise<void> {
+    if (redeploying) return;
+    redeploying = true;
+    addToast({ kind: "info", message: "Rebuilding prod SPA…" });
+    try {
+      const res = await fetch("/api/deploy", { method: "POST" });
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        code?: number | null;
+        output?: string;
+        durationMs?: number;
+      };
+      if (res.ok && body.ok) {
+        const secs = ((body.durationMs ?? 0) / 1000).toFixed(1);
+        addToast({
+          kind: "success",
+          message: `Prod rebuilt in ${secs}s — reload your prod tab to see it.`,
+        });
+      } else {
+        const tail = (body.output ?? "").split("\n").slice(-2).join(" ").trim();
+        addToast({
+          kind: "error",
+          message: `Redeploy failed (exit ${body.code ?? "?"}). ${tail || res.statusText}`,
+        });
+      }
+    } catch (e) {
+      addToast({
+        kind: "error",
+        message: `Redeploy failed: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    } finally {
+      redeploying = false;
+    }
+  }
   /** Daemon ids with an in-flight DELETE — drives the per-row spinner +
    *  disables the remove button so a double-click can't double-delete. */
   let daemonRemoving = new Set<string>();
@@ -1889,7 +1932,11 @@
    *  open-session entry whose source is sentinel-prefixed with
    *  `__new__:` — the column rendering branches on that to render
    *  TerminalView directly instead of the read-mode SessionView. */
-  function openNewAgentSession(wtPath: string, agent: "claude" | "codex") {
+  function openNewAgentSession(
+    wtPath: string,
+    agent: "claude" | "codex",
+    initialPrompt?: string,
+  ) {
     const id = `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     const synthetic = `__new__:${agent}:${id}`;
     const existing = openSessionsByWt[wtPath] ?? [];
@@ -1902,10 +1949,14 @@
       agent: "claude" | "codex";
       source: string;
       preassignedSessionId?: string;
+      initialPrompt?: string;
     } = { agent, source: synthetic };
     if (agent === "claude") {
       entry.preassignedSessionId = randomUUID();
     }
+    // Seeded when the column is started from the task queue (play button);
+    // cmdForOpenSession consumes it on the fresh spawn only.
+    if (initialPrompt) entry.initialPrompt = initialPrompt;
     const insertAt = visibleLeftInsertIndex(wtPath, existing);
     const next = [...existing];
     next.splice(insertAt, 0, entry);
@@ -2057,6 +2108,22 @@
     next.splice(insertAt, 0, entry);
     openSessionsByWt = { ...openSessionsByWt, [wtPath]: next };
     scrollNewColIntoView(wtPath, synthetic);
+  }
+
+  /** Start a queued task (QueueColumn play button): open a live agent
+   *  column in the task's worktree seeded with its prompt. Shell tasks get
+   *  a plain terminal (no positional prompt). The status flip to "running"
+   *  is done by QueueColumn, which owns task mutations. */
+  function startTask(task: {
+    worktreePath: string;
+    agent: "claude" | "codex" | "shell";
+    prompt?: string;
+  }) {
+    if (task.agent === "shell") {
+      openNewTerminalInWt(task.worktreePath);
+    } else {
+      openNewAgentSession(task.worktreePath, task.agent, task.prompt);
+    }
   }
 
   // --- Onboarding: "Get Started" inline AI description ----------------
@@ -6225,6 +6292,17 @@
           void refreshMessages();
           return;
         }
+        // Task queue mutated (by this client, another browser, or an agent via
+        // the CLI). Refetch this daemon's tasks; refreshTasks de-dupes a burst
+        // of these into a single GET, and each QueueColumn reads its own slice.
+        if (
+          payload.kind === "add_task" ||
+          payload.kind === "update_task" ||
+          payload.kind === "remove_task"
+        ) {
+          void refreshTasks();
+          return;
+        }
         if (payload.kind === "peerDiscovery") {
           peerDiscoveryEnabled =
             (payload as { enabled?: unknown }).enabled === true;
@@ -8496,9 +8574,17 @@
         </button>
         {#if daemonsMenuOpen}
           <Popover variant="actions" extraClass="daemons-popover" unclamped>
-            <svelte:fragment slot="head"
-              ><span>Remote daemons</span></svelte:fragment
-            >
+            <svelte:fragment slot="head">
+              <span>Remote daemons</span>
+              <button
+                class="daemons-redeploy"
+                disabled={redeploying}
+                title="Rebuild the prod SPA (packages/ui/dist) from the current source. Prod serves it fresh from disk — reload your prod tab to see it. No daemon restart, no dropped TUIs."
+                on:click|stopPropagation={redeployProd}
+              >
+                {#if redeploying}Rebuilding…{:else}Redeploy prod{/if}
+              </button>
+            </svelte:fragment>
             {#if remoteDaemons.length === 0}
               <p class="muted small nopad">No remote daemons yet.</p>
             {:else}
@@ -10638,20 +10724,26 @@
               {#if wt && summary}
                 {#if wt}
                   {@const stripFilter = stripFilterByWt[wt.path]}
-                  {#if (openSessionsByWt[wt.path]?.length ?? 0) > 0 || (stripFilter && stripFilter.notOpen.length > 0)}
-                    {@const existingSources = new Set(
-                      (wt.agents ?? []).flatMap((a) => sessionSurfaceKeys(a)),
-                    )}
-                    {@const visibleSessions = filterToExistingSessions(
-                      openSessionsByWt[wt.path] ?? [],
-                      existingSources,
-                    )}
-                    {#if visibleSessions.length > 0 || (stripFilter && stripFilter.notOpen.length > 0)}
-                      <div
-                        class="sessions-strip"
-                        data-wt-strip={wt.path}
-                        on:dragleave={(e) => handleStripDragLeave(e, wt.path)}
-                      >
+                  {@const existingSources = new Set(
+                    (wt.agents ?? []).flatMap((a) => sessionSurfaceKeys(a)),
+                  )}
+                  {@const visibleSessions = filterToExistingSessions(
+                    openSessionsByWt[wt.path] ?? [],
+                    existingSources,
+                  )}
+                  <!-- The strip always renders for an open worktree so each
+                   project shows its task queue (QueueColumn, first child)
+                   at terminal height, even with no live sessions. -->
+                  <div
+                    class="sessions-strip"
+                    data-wt-strip={wt.path}
+                    on:dragleave={(e) => handleStripDragLeave(e, wt.path)}
+                  >
+                    <QueueColumn
+                      worktreePath={wt.path}
+                      daemonId={daemonIdForWorktreePath(repos, wt.path)}
+                      onStart={startTask}
+                    />
                         <!-- Trailing spacer (the leading inset is handled by
                          `.sessions-strip { padding-left }`). Can't use
                          padding-right here — horizontally scrolling flex
@@ -11427,9 +11519,7 @@
                         {/if}
                         <span class="sessions-strip-pad" aria-hidden="true"
                         ></span>
-                      </div>
-                    {/if}
-                  {/if}
+                  </div>
 
                   <!-- Source-control foldout removed — git history now lives
                    in a session column (GitHistory.svelte). -->

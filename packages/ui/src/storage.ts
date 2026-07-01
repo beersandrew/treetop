@@ -751,6 +751,7 @@ export function cmdForOpenSession(
     resumeSessionId?: string;
     preassignedSessionId?: string;
     contextFilePath?: string;
+    initialPrompt?: string;
     claudeModel?: string;
     claudeEffort?: string;
     shellCmd?: string[];
@@ -794,6 +795,13 @@ export function cmdForOpenSession(
       cmd.push("--append-system-prompt-file", s.contextFilePath);
       cmd.push("--allow-dangerously-skip-permissions");
       cmd.push("Pick up where the previous conversation left off.");
+    } else if (s.initialPrompt) {
+      // Starting a queued task: seed its prompt as a trailing positional
+      // and skip permissions so the agent just gets to work. Only fires on
+      // the fresh spawn — the `sid` (resume) path returned above, so a
+      // reload after the agent minted its id won't re-send the prompt.
+      cmd.push("--allow-dangerously-skip-permissions");
+      cmd.push(s.initialPrompt);
     }
     return cmd;
   }
@@ -805,6 +813,7 @@ export function cmdForOpenSession(
         `Continue this conversation. Read the prior context from ${s.contextFilePath}`,
       ];
     }
+    if (s.initialPrompt) return ["codex", s.initialPrompt];
     return ["codex"];
   }
   // copilot has no resume semantics in v0; ollama no longer spawns a

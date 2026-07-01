@@ -232,6 +232,66 @@ interface RemoteDaemonsFile {
   remoteDaemons: RemoteDaemon[];
 }
 
+/**
+ * A queued task — a named unit of intended agent work parked against a
+ * worktree's in-row queue (see plans/PLAN-tasks.md). Filled by a user or
+ * another agent; worked off by a human. At this phase a task never spawns an
+ * agent — it's a backlog entry with a triage status. `start` is deferred.
+ */
+export type TaskStatus = "ready" | "running" | "blocked" | "done";
+export type TaskAgent = "claude" | "codex" | "shell";
+const VALID_TASK_AGENTS: ReadonlySet<string> = new Set([
+  "claude",
+  "codex",
+  "shell",
+]);
+const VALID_TASK_STATUSES: ReadonlySet<string> = new Set([
+  "ready",
+  "running",
+  "blocked",
+  "done",
+]);
+
+export interface Task {
+  id: string;
+  /** The worktree (cwd) this task is queued against. */
+  worktreePath: string;
+  agent: TaskAgent;
+  name: string;
+  /** The work for the agent; surfaced when a task is started (deferred). */
+  prompt?: string;
+  status: TaskStatus;
+  /** Who filed it — `"agent"` for tasks posted by another agent via the CLI. */
+  createdBy: "user" | "agent";
+  createdAt: string;
+  /** Free-text reason when `status === "blocked"`. */
+  blockedReason?: string;
+}
+
+/** Fields a caller supplies when queueing a task; the store fills `id`,
+ *  `createdAt`, and defaults `status` to `"ready"` and `createdBy` to
+ *  `"user"`. */
+export interface TaskInput {
+  worktreePath: string;
+  agent: TaskAgent;
+  name: string;
+  prompt?: string;
+  status?: TaskStatus;
+  createdBy?: "user" | "agent";
+}
+
+/** Mutable fields accepted by `updateTask`. */
+export interface TaskPatch {
+  name?: string;
+  prompt?: string;
+  status?: TaskStatus;
+  blockedReason?: string;
+}
+
+interface TasksFile {
+  tasks: Task[];
+}
+
 /** Fields a caller supplies when registering a remote daemon; the
  *  registry fills in `id` and `addedAt` and defaults `port`. */
 export interface RemoteDaemonInput {
@@ -250,6 +310,7 @@ const PREFS_FILE = "prefs.json";
 const OPEN_SESSIONS_PREF_KEY = "supergit:openSessions";
 const OPEN_SESSIONS_BACKUP_DIR = "supergit_openSessions";
 const REMOTE_DAEMONS_FILE = "remote-daemons.json";
+const TASKS_FILE = "tasks.json";
 const DEFAULT_REMOTE_DAEMON_PORT = 7777;
 
 function backupTimestamp(date = new Date()): string {
@@ -891,6 +952,126 @@ export class Workspace {
       join(this.path, REMOTE_DAEMONS_FILE),
       JSON.stringify(payload, null, 2),
     );
+  }
+
+  // ── Task queue (per-worktree backlog; see plans/PLAN-tasks.md) ───
+  // Mirrors the Repo / RemoteDaemon CRUD. Stored in its own tasks.json so it
+  // never clobbers repos.json, with a tolerant read so a corrupt/absent file
+  // degrades to an empty queue rather than breaking the dashboard. Writes go
+  // through writeTasks (temp + atomic rename).
+
+  async listTasks(): Promise<Task[]> {
+    try {
+      const raw = await readFile(join(this.path, TASKS_FILE), "utf-8");
+      const parsed = JSON.parse(raw) as TasksFile;
+      if (!parsed || !Array.isArray(parsed.tasks)) return [];
+      return parsed.tasks;
+    } catch {
+      return [];
+    }
+  }
+
+  async addTask(input: TaskInput): Promise<Task> {
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (name.length === 0) throw new Error("task name must be non-empty");
+    if (!VALID_TASK_AGENTS.has(input.agent)) {
+      throw new Error(`unknown task agent: ${String(input.agent)}`);
+    }
+    const worktreePath =
+      typeof input.worktreePath === "string" ? input.worktreePath.trim() : "";
+    if (worktreePath.length === 0) {
+      throw new Error("task worktreePath must be non-empty");
+    }
+    const status =
+      input.status && VALID_TASK_STATUSES.has(input.status)
+        ? input.status
+        : "ready";
+    const task: Task = {
+      id: randomUUID(),
+      worktreePath,
+      agent: input.agent,
+      name,
+      status,
+      createdBy: input.createdBy === "agent" ? "agent" : "user",
+      createdAt: new Date().toISOString(),
+    };
+    const prompt =
+      typeof input.prompt === "string" ? input.prompt.trim() : "";
+    if (prompt.length > 0) task.prompt = prompt;
+    const tasks = await this.listTasks();
+    tasks.push(task);
+    await this.writeTasks(tasks);
+    return task;
+  }
+
+  /** Patch a task in place. Returns the new + previous records (so a caller
+   *  can stash `previous` as an event inverse), or null when the id is
+   *  unknown. */
+  async updateTask(
+    id: string,
+    patch: TaskPatch,
+  ): Promise<{ task: Task; previous: Task } | null> {
+    const tasks = await this.listTasks();
+    const idx = tasks.findIndex((t) => t.id === id);
+    if (idx < 0) return null;
+    const previous = tasks[idx]!;
+    const next: Task = { ...previous };
+    if (patch.name !== undefined) {
+      const trimmed = patch.name.trim();
+      if (trimmed.length === 0) throw new Error("task name must be non-empty");
+      next.name = trimmed;
+    }
+    if (patch.prompt !== undefined) {
+      const trimmed = patch.prompt.trim();
+      if (trimmed.length > 0) next.prompt = trimmed;
+      else delete next.prompt;
+    }
+    if (patch.status !== undefined) {
+      if (!VALID_TASK_STATUSES.has(patch.status)) {
+        throw new Error(`unknown task status: ${patch.status}`);
+      }
+      next.status = patch.status;
+    }
+    if (patch.blockedReason !== undefined) {
+      const trimmed = patch.blockedReason.trim();
+      if (trimmed.length > 0) next.blockedReason = trimmed;
+      else delete next.blockedReason;
+    }
+    tasks[idx] = next;
+    await this.writeTasks(tasks);
+    return { task: next, previous };
+  }
+
+  async removeTask(id: string): Promise<boolean> {
+    const tasks = await this.listTasks();
+    const next = tasks.filter((t) => t.id !== id);
+    if (next.length === tasks.length) return false;
+    await this.writeTasks(next);
+    return true;
+  }
+
+  /** Re-insert a task with its original id + metadata (undo/redo parity with
+   *  restoreRepo). Refuses to duplicate an existing id. */
+  async restoreTask(task: Task): Promise<void> {
+    const tasks = await this.listTasks();
+    if (tasks.some((t) => t.id === task.id)) {
+      throw new Error(`Task already exists with id ${task.id}`);
+    }
+    tasks.push(task);
+    await this.writeTasks(tasks);
+  }
+
+  private async writeTasks(tasks: Task[]): Promise<void> {
+    const payload: TasksFile = { tasks };
+    const dst = join(this.path, TASKS_FILE);
+    const tmp = `${dst}.tmp`;
+    await writeFile(tmp, JSON.stringify(payload, null, 2));
+    try {
+      await rename(tmp, dst);
+    } catch (err) {
+      await unlink(tmp).catch(() => {});
+      throw err;
+    }
   }
 
   // ── UI preferences (shared across all clients) ───────────────────

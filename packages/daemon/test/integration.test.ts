@@ -13,7 +13,7 @@ import { test, expect, describe } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Workspace, type Repo } from "../src/workspace";
+import { Workspace, type Repo, type Task } from "../src/workspace";
 import { EventLog } from "../src/events";
 import { NotesStore } from "../src/notes";
 
@@ -61,6 +61,19 @@ async function undoAction(
       anchors: inv.note.anchors,
       tags: inv.note.tags,
     });
+  } else if (ev.type === "add_task") {
+    const inv = ev.inverse as { task: { id: string } };
+    const removed = await ws.removeTask(inv.task.id);
+    if (!removed) throw new Error("inverse failed: task no longer exists");
+  } else if (ev.type === "remove_task") {
+    const inv = ev.inverse as { task: Task };
+    await ws.restoreTask(inv.task);
+  } else if (ev.type === "update_task") {
+    // Restore the exact prior record: drop the current row, re-insert the
+    // snapshot stashed in the inverse.
+    const inv = ev.inverse as { previous: Task };
+    await ws.removeTask(inv.previous.id);
+    await ws.restoreTask(inv.previous);
   } else {
     throw new Error(`no inverse handler for ${ev.type}`);
   }
@@ -108,6 +121,16 @@ async function redoAction(
     if (!notes) throw new Error("notes store required for remove_note redo");
     const inv = ev.inverse as { note: { id: string } };
     await notes.remove(inv.note.id);
+  } else if (ev.type === "add_task") {
+    const inv = ev.inverse as { task: Task };
+    await ws.restoreTask(inv.task);
+  } else if (ev.type === "remove_task") {
+    const inv = ev.inverse as { task: { id: string } };
+    const removed = await ws.removeTask(inv.task.id);
+    if (!removed) throw new Error("redo failed: task no longer exists");
+  } else if (ev.type === "update_task") {
+    const p = ev.payload as { id: string; patch: Record<string, unknown> };
+    await ws.updateTask(p.id, p.patch);
   } else {
     throw new Error(`no redo handler for ${ev.type}`);
   }
@@ -357,5 +380,89 @@ describe("create_note / remove_note → undo → redo round-trips", () => {
     // create_note — undo that too and the note is gone for real.
     await undoAction(ws, events, createEv.id, notes);
     expect(await notes.list()).toHaveLength(0);
+  });
+});
+
+describe("task add → undo → redo round-trip", () => {
+  test("restores the same task with the same id and metadata", async () => {
+    const dir = await tempDir();
+    const ws = await Workspace.open(dir);
+    const events = await EventLog.open(dir);
+
+    const task = await ws.addTask({
+      worktreePath: "/wt",
+      agent: "claude",
+      name: "Measure esfUsd caps",
+    });
+    const addEv = await events.append({
+      type: "add_task",
+      actor: "user",
+      payload: { name: task.name },
+      inverse: { task },
+    });
+
+    expect(await ws.listTasks()).toHaveLength(1);
+
+    await undoAction(ws, events, addEv.id);
+    expect(await ws.listTasks()).toHaveLength(0);
+    expect((await events.findById(addEv.id))?.undone).toBe(true);
+    expect((await events.findById(addEv.id))?.redoable).toBe(true);
+
+    await redoAction(ws, events, addEv.id);
+    const after = await ws.listTasks();
+    expect(after).toHaveLength(1);
+    expect(after[0]?.id).toBe(task.id);
+    expect(after[0]?.createdAt).toBe(task.createdAt);
+    expect((await events.findById(addEv.id))?.undone).toBe(false);
+  });
+
+  test("update → undo restores the previous record, redo re-applies", async () => {
+    const dir = await tempDir();
+    const ws = await Workspace.open(dir);
+    const events = await EventLog.open(dir);
+
+    const task = await ws.addTask({
+      worktreePath: "/wt",
+      agent: "claude",
+      name: "triage",
+    });
+    const patch = { status: "done" as const };
+    const res = await ws.updateTask(task.id, patch);
+    const updEv = await events.append({
+      type: "update_task",
+      actor: "user",
+      payload: { id: task.id, patch },
+      inverse: { previous: res!.previous },
+    });
+
+    expect((await ws.listTasks())[0]?.status).toBe("done");
+
+    await undoAction(ws, events, updEv.id);
+    expect((await ws.listTasks())[0]?.status).toBe("ready");
+
+    await redoAction(ws, events, updEv.id);
+    expect((await ws.listTasks())[0]?.status).toBe("done");
+  });
+
+  test("an agent-filed task carries actor:agent on its event", async () => {
+    const dir = await tempDir();
+    const ws = await Workspace.open(dir);
+    const events = await EventLog.open(dir);
+
+    const task = await ws.addTask({
+      worktreePath: "/wt",
+      agent: "codex",
+      name: "filed by an agent",
+      createdBy: "agent",
+    });
+    const ev = await events.append({
+      type: "add_task",
+      actor: "agent",
+      payload: { name: task.name },
+      inverse: { task },
+    });
+    expect(task.createdBy).toBe("agent");
+    expect((await events.findById(ev.id))?.actor).toBe("agent");
+    expect((await events.findById(ev.id))?.reversible).toBe(true);
   });
 });

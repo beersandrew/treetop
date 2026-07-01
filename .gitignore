@@ -10,3 +10,18 @@ dist/
 build/
 artifacts/
 packages/daemon/src/terminals/helper-go/pty-helper
+
+# supergit workspace state — normally lives in the workspace dir
+# (~/supergit/workspaces/<name>/), NEVER in this (public) repo. This is a
+# defensive guard against an accidental commit if the daemon is ever pointed
+# at a workspace inside the repo tree (e.g. SUPERGIT_WORKSPACE=./scratch).
+# These files can contain private project paths and prompts. Force-add with
+# `git add -f` if you ever genuinely need a file by one of these names.
+tasks.json
+repos.json
+prefs.json
+events.jsonl
+session-titles.json
+remote-daemons.json
+*.json.tmp
+context-handoffs/

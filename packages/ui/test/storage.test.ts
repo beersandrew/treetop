@@ -1172,6 +1172,103 @@ describe("cmdForOpenSession", () => {
       ),
     ).toEqual(["codex", "resume", "ses_99"]);
   });
+
+  test("claude with initialPrompt auto-runs the seeded prompt (task start)", () => {
+    // Starting a queued task seeds the task's prompt as a trailing
+    // positional and pairs it with --allow-dangerously-skip-permissions
+    // so the agent just gets to work (see plans/PLAN-tasks.md "Start").
+    // The flags must precede the positional or claude reads the prompt as
+    // a flag value.
+    expect(
+      cmdForOpenSession(
+        {
+          agent: "claude",
+          preassignedSessionId: "aaaa-bbbb",
+          initialPrompt: "Fix the flaky login test",
+        },
+        "/bin/zsh",
+      ),
+    ).toEqual([
+      "claude",
+      "--session-id",
+      "aaaa-bbbb",
+      "--allow-dangerously-skip-permissions",
+      "Fix the flaky login test",
+    ]);
+  });
+
+  test("claude initialPrompt is ignored once resumeSessionId is stamped (no re-send on reload)", () => {
+    // Once the agent has minted its session id, reloads resume rather than
+    // re-seeding the prompt — otherwise every reload would re-submit the
+    // task prompt into the live conversation.
+    expect(
+      cmdForOpenSession(
+        {
+          agent: "claude",
+          resumeSessionId: "abc-123",
+          initialPrompt: "Fix the flaky login test",
+        },
+        "/bin/zsh",
+      ),
+    ).toEqual([
+      "claude",
+      "--resume",
+      "abc-123",
+      "--allow-dangerously-skip-permissions",
+    ]);
+  });
+
+  test("claude contextFilePath wins over initialPrompt (handoff prompt is authoritative)", () => {
+    // A context handoff and a task prompt shouldn't both land; the handoff
+    // path is the established one, so it takes precedence.
+    expect(
+      cmdForOpenSession(
+        {
+          agent: "claude",
+          contextFilePath: "/tmp/ctx.md",
+          initialPrompt: "task prompt",
+        },
+        "/bin/zsh",
+      ),
+    ).toEqual([
+      "claude",
+      "--append-system-prompt-file",
+      "/tmp/ctx.md",
+      "--allow-dangerously-skip-permissions",
+      "Pick up where the previous conversation left off.",
+    ]);
+  });
+
+  test("codex with initialPrompt passes it as the positional prompt", () => {
+    expect(
+      cmdForOpenSession(
+        { agent: "codex", initialPrompt: "Fix the flaky login test" },
+        "/bin/zsh",
+      ),
+    ).toEqual(["codex", "Fix the flaky login test"]);
+  });
+
+  test("codex resumeSessionId wins over initialPrompt (no re-send on reload)", () => {
+    expect(
+      cmdForOpenSession(
+        {
+          agent: "codex",
+          resumeSessionId: "ses_99",
+          initialPrompt: "task prompt",
+        },
+        "/bin/zsh",
+      ),
+    ).toEqual(["codex", "resume", "ses_99"]);
+  });
+
+  test("shell ignores initialPrompt (no positional prompt for a plain PTY)", () => {
+    expect(
+      cmdForOpenSession(
+        { agent: "shell", initialPrompt: "task prompt" },
+        "/bin/zsh",
+      ),
+    ).toEqual(["/bin/zsh", "-l"]);
+  });
 });
 
 describe("claudeModelAlias", () => {

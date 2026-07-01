@@ -33,6 +33,16 @@ export class OrphanCleaner {
     this.log = opts.log;
   }
 
+  /** True while at least one frontend is connected — the app's SSE stream
+   *  and/or any terminal WS. The per-terminal grace-reaper consults this so a
+   *  live agent is never reaped while the app is still open: a column scrolled
+   *  off-screen (or a reload) drops its terminal WS, but the SSE stream keeps
+   *  this true across that churn. When it finally goes false (no frontend at
+   *  all), the orphan timer below owns cleanup. */
+  isFrontendConnected(): boolean {
+    return this.frontendCount > 0;
+  }
+
   onFrontendConnected(): void {
     this.frontendCount++;
     if (this.orphanTimer) {

@@ -216,6 +216,7 @@ import { resolveInstallPayload } from "./install-payload";
 import { listDrives } from "./drives";
 import { ProvisionManager } from "./provision-manager";
 import { makeProvisionSpawner } from "./provision-spawn";
+import { runDeploy } from "./deploy";
 import { buildProvisionPlan } from "./provision";
 import { ClaudeCliAdapter } from "./claude-cli-adapter";
 import { CodexAppServerAdapter } from "./codex-app-server";
@@ -2383,6 +2384,14 @@ function startGraceIfIdle(termId: string) {
   const handle = terminalBackend.get(termId);
   if (!handle) return;
   if (handle.subscriberCount() > 0) return;
+  // Never grace-reap a live agent while the app is still open. A column
+  // scrolled off-screen (or a reload) drops its terminal WS, but the app's SSE
+  // stream keeps a frontend connected — so the PTY must survive and the column
+  // cleanly reattaches on reveal. Cleanup is left to OrphanCleaner (fires only
+  // when NO frontend is connected at all) and explicit dispose (DELETE
+  // /api/terminals/:id). Without this gate, scrolling a working agent away
+  // reaped its PTY after GRACE_MS and the session died offscreen.
+  if (orphanCleaner.isFrontendConnected()) return;
   if (graceTimers.has(termId)) return;
   console.log(
     `supergit daemon: terminal grace scheduled id=${termId} pid=${handle.pid} delay=${GRACE_MS}ms`,
@@ -3033,6 +3042,20 @@ const server = Bun.serve<TermWsData, never>({
         console.log("supergit daemon: /api/shutdown requested");
         setTimeout(() => shutdown("/api/shutdown"), 50);
         return json({ ok: true, pid: process.pid });
+      }
+
+      // Rebuild the prod SPA (packages/ui/dist) from the current source —
+      // the "redeploy dev → local prod" button. The prod daemon serves
+      // that dir fresh from disk, so this is a full UI redeploy with no
+      // daemon restart and no killed PTYs; the user just reloads their
+      // prod tab. Ships UI changes only, not daemon-code changes.
+      if (url.pathname === "/api/deploy" && req.method === "POST") {
+        console.log("supergit daemon: /api/deploy (rebuild prod SPA) requested");
+        const result = await runDeploy(resolve(import.meta.dir, "../../.."));
+        console.log(
+          `supergit daemon: deploy ${result.ok ? "ok" : "FAILED"} (exit ${result.code}) in ${result.durationMs}ms`,
+        );
+        return json(result, { status: result.ok ? 200 : 500 });
       }
 
       // Diagnostics: env snapshot of a spawned PTY. ?id=<termId> picks a
@@ -8853,6 +8876,28 @@ const server = Bun.serve<TermWsData, never>({
                 kind: inv.note.kind,
                 target: inv.note.target,
               });
+            } else if (original.type === "add_task") {
+              const inv = original.inverse as { task: { id: string } };
+              const removed = await workspace.removeTask(inv.task.id);
+              if (!removed) {
+                return json(
+                  { error: "inverse failed: task no longer exists" },
+                  { status: 409 },
+                );
+              }
+            } else if (original.type === "remove_task") {
+              const inv = original.inverse as {
+                task: import("./workspace").Task;
+              };
+              await workspace.restoreTask(inv.task);
+            } else if (original.type === "update_task") {
+              // Restore the prior record: drop the current row, re-insert the
+              // snapshot stashed in the inverse.
+              const inv = original.inverse as {
+                previous: import("./workspace").Task;
+              };
+              await workspace.removeTask(inv.previous.id);
+              await workspace.restoreTask(inv.previous);
             } else {
               return json(
                 { error: `no inverse handler for type: ${original.type}` },
@@ -8900,6 +8945,26 @@ const server = Bun.serve<TermWsData, never>({
             } else if (original.type === "remove_note") {
               const inv = original.inverse as { note: { id: string } };
               await notes.remove(inv.note.id);
+            } else if (original.type === "add_task") {
+              const inv = original.inverse as {
+                task: import("./workspace").Task;
+              };
+              await workspace.restoreTask(inv.task);
+            } else if (original.type === "remove_task") {
+              const inv = original.inverse as { task: { id: string } };
+              const removed = await workspace.removeTask(inv.task.id);
+              if (!removed) {
+                return json(
+                  { error: "redo failed: task no longer exists" },
+                  { status: 409 },
+                );
+              }
+            } else if (original.type === "update_task") {
+              const p = original.payload as {
+                id: string;
+                patch: import("./workspace").TaskPatch;
+              };
+              await workspace.updateTask(p.id, p.patch);
             } else {
               return json(
                 { error: `no redo handler for type: ${original.type}` },
@@ -8921,6 +8986,111 @@ const server = Bun.serve<TermWsData, never>({
             { status: 500 },
           );
         }
+      }
+
+      // ── Task queue (per-worktree backlog; see plans/PLAN-tasks.md) ───
+      // Mirrors the /api/repos CRUD: each mutation appends a reversible event
+      // and broadcasts a change so every client refreshes. Agent-filed tasks
+      // (createdBy: "agent") carry actor:"agent" on their event.
+
+      if (url.pathname === "/api/tasks" && req.method === "GET") {
+        const wt = url.searchParams.get("worktree");
+        const all = await workspace.listTasks();
+        return json(wt ? all.filter((t) => t.worktreePath === wt) : all);
+      }
+
+      if (url.pathname === "/api/tasks" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          worktreePath?: unknown;
+          agent?: unknown;
+          name?: unknown;
+          prompt?: unknown;
+          status?: unknown;
+          createdBy?: unknown;
+        } | null;
+        if (typeof body !== "object" || body === null) {
+          return json({ error: "body must be a JSON object" }, { status: 400 });
+        }
+        try {
+          const task = await workspace.addTask({
+            worktreePath: String(body.worktreePath ?? ""),
+            agent: body.agent as import("./workspace").TaskAgent,
+            name: String(body.name ?? ""),
+            prompt: typeof body.prompt === "string" ? body.prompt : undefined,
+            status:
+              typeof body.status === "string"
+                ? (body.status as import("./workspace").TaskStatus)
+                : undefined,
+            createdBy: body.createdBy === "agent" ? "agent" : "user",
+          });
+          await events.append({
+            type: "add_task",
+            actor: task.createdBy === "agent" ? "agent" : "user",
+            payload: { name: task.name, worktreePath: task.worktreePath },
+            inverse: { task },
+          });
+          broadcast("change", { kind: "add_task", task });
+          return json(task, { status: 201 });
+        } catch (e) {
+          return json(
+            { error: String(e instanceof Error ? e.message : e) },
+            { status: 400 },
+          );
+        }
+      }
+
+      const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
+      if (taskMatch && req.method === "PATCH") {
+        const id = taskMatch[1]!;
+        const body = (await req.json().catch(() => null)) as {
+          name?: unknown;
+          prompt?: unknown;
+          status?: unknown;
+          blockedReason?: unknown;
+        } | null;
+        if (typeof body !== "object" || body === null) {
+          return json({ error: "body must be a JSON object" }, { status: 400 });
+        }
+        const patch: import("./workspace").TaskPatch = {};
+        if (typeof body.name === "string") patch.name = body.name;
+        if (typeof body.prompt === "string") patch.prompt = body.prompt;
+        if (typeof body.status === "string")
+          patch.status = body.status as import("./workspace").TaskStatus;
+        if (typeof body.blockedReason === "string")
+          patch.blockedReason = body.blockedReason;
+        try {
+          const res = await workspace.updateTask(id, patch);
+          if (!res) return json({ error: "not found" }, { status: 404 });
+          await events.append({
+            type: "update_task",
+            actor: "user",
+            payload: { id, patch },
+            inverse: { previous: res.previous },
+          });
+          broadcast("change", { kind: "update_task", task: res.task });
+          return json(res.task);
+        } catch (e) {
+          return json(
+            { error: String(e instanceof Error ? e.message : e) },
+            { status: 400 },
+          );
+        }
+      }
+
+      if (taskMatch && req.method === "DELETE") {
+        const id = taskMatch[1]!;
+        const tasks = await workspace.listTasks();
+        const task = tasks.find((t) => t.id === id);
+        if (!task) return json({ error: "not found" }, { status: 404 });
+        await workspace.removeTask(id);
+        await events.append({
+          type: "remove_task",
+          actor: "user",
+          payload: { id },
+          inverse: { task },
+        });
+        broadcast("change", { kind: "remove_task", id });
+        return new Response(null, { status: 204, headers: CORS });
       }
 
       // ── UI preferences (shared across browser + native app) ──────────

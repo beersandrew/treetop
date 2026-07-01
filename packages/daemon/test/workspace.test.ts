@@ -896,3 +896,149 @@ describe("Workspace", () => {
     expect(await ws.getPrefs()).toEqual({});
   });
 });
+
+describe("Workspace tasks", () => {
+  test("lists no tasks initially (no tasks.json yet)", async () => {
+    const ws = await Workspace.open(await tempDir());
+    expect(await ws.listTasks()).toEqual([]);
+  });
+
+  test("addTask returns a task with id, createdAt, default status ready", async () => {
+    const ws = await Workspace.open(await tempDir());
+    const task = await ws.addTask({
+      worktreePath: "/repos/app/main",
+      agent: "claude",
+      name: "Measure esfUsd caps",
+    });
+    expect(task.name).toBe("Measure esfUsd caps");
+    expect(task.worktreePath).toBe("/repos/app/main");
+    expect(task.agent).toBe("claude");
+    expect(task.status).toBe("ready");
+    expect(task.createdBy).toBe("user");
+    expect(task.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(Date.parse(task.createdAt)).not.toBeNaN();
+  });
+
+  test("addTask keeps the optional prompt and createdBy=agent", async () => {
+    const ws = await Workspace.open(await tempDir());
+    const task = await ws.addTask({
+      worktreePath: "/repos/app/main",
+      agent: "codex",
+      name: "Profile enrich storm",
+      prompt: "Investigate the cold-start enrich storm and propose fixes.",
+      createdBy: "agent",
+    });
+    expect(task.prompt).toBe(
+      "Investigate the cold-start enrich storm and propose fixes.",
+    );
+    expect(task.createdBy).toBe("agent");
+  });
+
+  test("addTask rejects an empty name", async () => {
+    const ws = await Workspace.open(await tempDir());
+    await expect(
+      ws.addTask({ worktreePath: "/wt", agent: "claude", name: "  " }),
+    ).rejects.toThrow();
+  });
+
+  test("addTask rejects an unknown agent", async () => {
+    const ws = await Workspace.open(await tempDir());
+    await expect(
+      ws.addTask({
+        worktreePath: "/wt",
+        // @ts-expect-error — exercising the runtime guard at the boundary
+        agent: "gpt",
+        name: "x",
+      }),
+    ).rejects.toThrow();
+  });
+
+  test("tasks persist across re-opens", async () => {
+    const dir = await tempDir();
+    const ws1 = await Workspace.open(dir);
+    await ws1.addTask({ worktreePath: "/wt", agent: "claude", name: "one" });
+    await ws1.addTask({ worktreePath: "/wt", agent: "codex", name: "two" });
+    const ws2 = await Workspace.open(dir);
+    expect((await ws2.listTasks()).map((t) => t.name)).toEqual(["one", "two"]);
+  });
+
+  test("updateTask patches status and returns the new + previous record", async () => {
+    const ws = await Workspace.open(await tempDir());
+    const task = await ws.addTask({
+      worktreePath: "/wt",
+      agent: "claude",
+      name: "triage me",
+    });
+    const res = await ws.updateTask(task.id, { status: "done" });
+    expect(res).not.toBeNull();
+    expect(res!.previous.status).toBe("ready");
+    expect(res!.task.status).toBe("done");
+    // persisted
+    expect((await ws.listTasks())[0]!.status).toBe("done");
+  });
+
+  test("updateTask records a blockedReason alongside status", async () => {
+    const ws = await Workspace.open(await tempDir());
+    const task = await ws.addTask({
+      worktreePath: "/wt",
+      agent: "claude",
+      name: "blocked one",
+    });
+    const res = await ws.updateTask(task.id, {
+      status: "blocked",
+      blockedReason: "waiting on usd-67",
+    });
+    expect(res!.task.status).toBe("blocked");
+    expect(res!.task.blockedReason).toBe("waiting on usd-67");
+  });
+
+  test("updateTask returns null for an unknown id", async () => {
+    const ws = await Workspace.open(await tempDir());
+    expect(await ws.updateTask("nope", { status: "done" })).toBeNull();
+  });
+
+  test("removeTask deletes by id and reports success", async () => {
+    const ws = await Workspace.open(await tempDir());
+    const task = await ws.addTask({
+      worktreePath: "/wt",
+      agent: "claude",
+      name: "remove me",
+    });
+    expect(await ws.removeTask(task.id)).toBe(true);
+    expect(await ws.listTasks()).toEqual([]);
+    // removing again is a no-op false (mirrors removeRepo)
+    expect(await ws.removeTask(task.id)).toBe(false);
+  });
+
+  test("restoreTask re-inserts with the original id + createdAt", async () => {
+    const ws = await Workspace.open(await tempDir());
+    const task = await ws.addTask({
+      worktreePath: "/wt",
+      agent: "claude",
+      name: "restore me",
+    });
+    await ws.removeTask(task.id);
+    await ws.restoreTask(task);
+    const after = await ws.listTasks();
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe(task.id);
+    expect(after[0]!.createdAt).toBe(task.createdAt);
+  });
+
+  test("restoreTask refuses to duplicate an existing id", async () => {
+    const ws = await Workspace.open(await tempDir());
+    const task = await ws.addTask({
+      worktreePath: "/wt",
+      agent: "claude",
+      name: "dupe",
+    });
+    await expect(ws.restoreTask(task)).rejects.toThrow();
+  });
+
+  test("listTasks tolerates a corrupt tasks.json", async () => {
+    const dir = await tempDir();
+    const ws = await Workspace.open(dir);
+    await writeFile(join(dir, "tasks.json"), "not json");
+    expect(await ws.listTasks()).toEqual([]);
+  });
+});
